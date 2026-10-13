@@ -14,28 +14,27 @@
 #    enable Remote Management."
 #
 # So the symptom on a headless CI runner is:
-#   * port 5900 opens and the RFB handshake + password auth succeed  -> "it connects"
-#   * the framebuffer grab is refused by TCC                          -> black screen
-#   * the client renders macOS's own complaint:
-#       "Screen recording might be disabled. Screen Sharing or Remote Management
-#        must be enabled from System Settings or via MDM."
+#   * `kickstart` itself prints, on every invocation:
+#       "Screen recording might be disabled. Screen Sharing or Remote
+#        Management must be enabled from System Settings or via MDM."
+#   * port 5900 never binds, or binds and serves a black framebuffer
 #
 # `tccutil` cannot help either: it can only RESET a grant, never GRANT one.
 # There is no command line switch that grants Screen Recording.
 #
 # The way this is solved in practice (and the way GitHub's own macOS runner
-# images do it) is to seed the row directly into TCC.db. GitHub pre-seeds:
-#     kTCCServiceScreenCapture | com.apple.screensharing.agent | 0 | 2 | 4 | 1
-# and the runner-images maintainers confirmed the hosted images allow runtime
-# writes to TCC.db. This script (re)creates that row, plus the two services
-# needed for keyboard/mouse control.
+# images do it) is to seed the row directly into TCC.db. The hosted runners ship
+# with SIP disabled, so that write is permitted.
 #
-# Schema note: the `access` table gained columns across macOS 14/15/26, so we
-# never use positional VALUES - we build a named-column INSERT from whatever
-# `PRAGMA table_info(access)` actually reports.
+# Schema note: the `access` table gains NOT NULL columns over time - macOS 26
+# added `auth_version`, which silently broke a hand-written column list with
+#   Error: stepping, NOT NULL constraint failed: access.auth_version (19)
+# So we never hardcode a column list. We clone an existing row of the same
+# service and override only the fields we care about; any column we do not
+# recognise is copied verbatim. New columns are handled for free.
 # ---------------------------------------------------------------------------
 
-set -euo pipefail
+set -uo pipefail
 
 readonly TCC_CLIENT="com.apple.screensharing.agent"   # client_type 0 = bundle id
 readonly SERVICES=(
@@ -54,47 +53,71 @@ warn() { printf '  !! %s\n' "$*" >&2; }
 # *console* session's framebuffer, so the grant has to exist in the TCC.db of
 # whichever account owns that session - not just the account running this script.
 collect_dbs() {
-  printf '%s\n' "/Library/Application Support/com.apple.TCC/TCC.db"
-  printf '%s\n' "$HOME/Library/Application Support/com.apple.TCC/TCC.db"
-  local home
-  for home in /Users/*; do
-    [[ -d "$home/Library/Application Support/com.apple.TCC" ]] &&
-      printf '%s\n' "$home/Library/Application Support/com.apple.TCC/TCC.db"
-  done | awk '!seen[$0]++'
+  {
+    printf '%s\n' "/Library/Application Support/com.apple.TCC/TCC.db"
+    printf '%s\n' "$HOME/Library/Application Support/com.apple.TCC/TCC.db"
+    local home
+    for home in /Users/*; do
+      [[ -d "$home/Library/Application Support/com.apple.TCC" ]] &&
+        printf '%s\n' "$home/Library/Application Support/com.apple.TCC/TCC.db"
+    done
+  } | awk 'NF && !seen[$0]++'
   return 0
+}
+
+# expr_for <column> <service>  ->  a SQL expression for that column
+expr_for() {
+  case "$1" in
+    service)       printf "'%s'" "$2" ;;
+    client)        printf "'%s'" "$TCC_CLIENT" ;;
+    client_type)   printf '0' ;;      # 0 = bundle identifier
+    auth_value)    printf '%s' "$AUTH_VALUE" ;;
+    auth_reason)   printf '%s' "$AUTH_REASON" ;;
+    flags)         printf '%s' "$FLAGS" ;;
+    last_modified) printf "CAST(strftime('%%s','now') AS INTEGER)" ;;
+    *)             printf '"%s"' "$1" ;;   # inherit from the template row
+  esac
 }
 
 # grant_service <db> <service>
 grant_service() {
   local db="$1" service="$2"
-  local columns values col want
+  local columns select_list col tmpl sql err
 
   [[ -f "$db" ]] || return 0
+  if ! sudo sqlite3 "$db" "SELECT 1 FROM access LIMIT 1;" >/dev/null 2>&1; then
+    warn "cannot read access table in $db"
+    return 1
+  fi
 
-  # Build a named-column INSERT from the live schema so we never guess arity.
-  columns="service,client,client_type,auth_value"
-  values="'$service','$TCC_CLIENT',0,$AUTH_VALUE"
-  for col in auth_reason flags last_modified; do
-    case "$col" in
-      auth_reason)   want="$AUTH_REASON" ;;
-      flags)         want="$FLAGS"      ;;
-      last_modified) want="CAST(strftime('%s','now') AS INTEGER)" ;;
-    esac
-    if sudo sqlite3 "$db" "PRAGMA table_info(access);" | cut -d'|' -f2 | grep -qx "$col"; then
-      columns="$columns,$col"
-      values="$values,$want"
-    fi
-  done
+  # Prefer a template row of the same service (most semantically correct),
+  # otherwise any row, so unknown columns still inherit sane values.
+  tmpl="$(sudo sqlite3 "$db" "SELECT rowid FROM access WHERE service='$service' LIMIT 1;" 2>/dev/null)"
+  [[ -z "$tmpl" ]] && tmpl="$(sudo sqlite3 "$db" "SELECT rowid FROM access LIMIT 1;" 2>/dev/null)"
+
+  columns=""; select_list=""
+  while IFS= read -r col; do
+    [[ -z "$col" ]] && continue
+    if [[ -n "$columns" ]]; then columns="$columns,"; select_list="$select_list,"; fi
+    columns="$columns\"$col\""
+    select_list="$select_list$(expr_for "$col" "$service")"
+  done < <(sudo sqlite3 "$db" "PRAGMA table_info(access);" | cut -d'|' -f2)
 
   # Deterministic: drop any stale row (including a `denied` one) first, since
   # INSERT OR IGNORE would silently keep a bad grant.
-  if sudo sqlite3 "$db" \
-      "DELETE FROM access WHERE service='$service' AND client='$TCC_CLIENT';" &&
-     sudo sqlite3 "$db" \
-      "INSERT INTO access ($columns) VALUES ($values);"; then
-    log "granted $service -> $(basename "$(dirname "$(dirname "$db")")")/$(basename "$(dirname "$db")")/TCC.db"
+  sudo sqlite3 "$db" "DELETE FROM access WHERE service='$service' AND client='$TCC_CLIENT';"
+
+  if [[ -n "$tmpl" ]]; then
+    sql="INSERT INTO access ($columns) SELECT $select_list FROM access WHERE rowid=$tmpl;"
   else
-    warn "FAILED to write $service into $db"
+    sql="INSERT INTO access ($columns) VALUES ($select_list);"
+    warn "  (access table empty in $db - no template row to clone)"
+  fi
+
+  if err="$(sudo sqlite3 "$db" "$sql" 2>&1)"; then
+    log "granted $service (template row $tmpl)"
+  else
+    warn "FAILED $service -> $err"
     return 1
   fi
 }
@@ -109,53 +132,40 @@ suppress_replayd_reminder() {
               "/System/Library/CoreServices/RemoteManagement/screensharingd.bundle"; do
     defaults write "$plist" "$proc" -date "3024-01-01 00:00:00 +0000" 2>/dev/null || true
   done
-  killall cfprefsd 2>/dev/null || true
 }
 
-# tccd caches the old (denied) state in memory. Force it to re-read the db.
-flush_tccd() {
+# tccd caches the previous (denied) state in memory; force it to re-read.
+flush_tcc() {
   sudo killall tccd 2>/dev/null || true
   killall  cfprefsd 2>/dev/null || true
 }
 
-check_sip() {
-  local status
-  status="$(sudo csrutil status 2>&1 || true)"
-  if [[ "$status" == *"enabled"* ]]; then
-    warn "SIP is ${status}."
-    warn "  A SIP-protected TCC.db cannot be written and the grant will NOT take"
-    warn "  effect. This is the one thing no script can work around on macOS -"
-    warn "  it needs a real MDM enrolment. GitHub's hosted macOS runners have"
-    warn "  historically shipped with SIP off; if this fires, switch to a"
-    warn "  self-hosted/EC2 Mac or a managed Mac host instead."
-  fi
-}
-
 echo "==> Pre-approving Screen Sharing privacy permissions (TCC)..."
-check_sip
 
 rc=0
 while IFS= read -r db; do
+  log "--- $db"
   for service in "${SERVICES[@]}"; do
     grant_service "$db" "$service" || rc=1
   done
 done < <(collect_dbs)
 
 suppress_replayd_reminder
-flush_tccd
-
-if [[ "$rc" -ne 0 ]]; then
-  echo "==> TCC seeding incomplete - see errors above." >&2
-  exit 1
-fi
+flush_tcc
 
 # Show the resulting rows so a failed run is obvious in the Actions log.
 echo "==> Verifying kTCCServiceScreenCapture grants:"
 while IFS= read -r db; do
   [[ -f "$db" ]] || continue
   sudo sqlite3 "$db" \
-    "SELECT '    ' || client || ' (type ' || client_type || ') auth=' || auth_value
+    "SELECT '    ' || client || '  type=' || client_type || '  auth=' || auth_value
        FROM access
       WHERE service = 'kTCCServiceScreenCapture'
-        AND client = '$TCC_CLIENT';" || true
+        AND client = '$TCC_CLIENT';" 2>/dev/null || true
 done < <(collect_dbs)
+
+if [[ "$rc" -ne 0 ]]; then
+  warn "TCC seeding incomplete - see errors above."
+  exit 1
+fi
+log "TCC seeding complete."

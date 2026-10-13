@@ -65,14 +65,19 @@ jobs:
 
       - name: Health Check
         run: |
-          echo "--- listener ---"
+          echo "--- listener on 5900 ---"
           lsof -nP -iTCP:5900 -sTCP:LISTEN || echo "NOT LISTENING"
-          echo "--- console session owner ---"
+          echo "--- Apple remote daemons ---"
+          ps aux | grep -iE 'screenshar|ARDAgent|AppleVNC' | grep -v grep || echo "(no ARD/VNC process)"
+          echo "--- console session owner (empty = no GUI login) ---"
           stat -f '%Su' /dev/console
-          echo "--- Screen Sharing TCC grant ---"
+          echo "--- TCC grants for screen sharing ---"
           sudo sqlite3 "/Library/Application Support/com.apple.TCC/TCC.db" \
-            "SELECT service||' -> '||client||' auth='||auth_value FROM access WHERE client='com.apple.screensharing.agent';"
-          echo "--- SIP (must NOT be enabled for the TCC write to work) ---"
+            "SELECT service||' -> '||client||' auth='||auth_value||' v='||COALESCE(auth_version,'-') FROM access WHERE client LIKE '%screenshar%' OR client LIKE '%ARDAgent%';"
+          echo "--- all ScreenCapture grants (sample) ---"
+          sudo sqlite3 "/Library/Application Support/com.apple.TCC/TCC.db" \
+            "SELECT client FROM access WHERE service='kTCCServiceScreenCapture' LIMIT 10;"
+          echo "--- SIP ---"
           sudo csrutil status || true
 
       - name: Keep-Alive Loop (Up to 6 Hours)
