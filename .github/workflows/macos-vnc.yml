@@ -32,6 +32,14 @@ on:
           - 'ap'
           - 'us'
           - 'eu'
+      legacy_vnc:
+        description: 'Legacy VNC (VNC4) protocol - insecure, turn OFF if your client supports Apple auth'
+        required: false
+        default: 'yes'
+        type: choice
+        options:
+          - 'yes'
+          - 'no'
 
 jobs:
   macos-desktop:
@@ -49,10 +57,23 @@ jobs:
           SECRET_NGROK_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
           VNC_PASSWORD: ${{ github.event.inputs.vnc_password || 'FarisMac2026' }}
           NGROK_REGION: ${{ github.event.inputs.ngrok_region || 'in' }}
+          LEGACY_VNC: ${{ github.event.inputs.legacy_vnc || 'yes' }}
         run: |
           chmod +x scripts/setup_vnc.sh
           FINAL_TOKEN="${INPUT_NGROK_TOKEN:-$SECRET_NGROK_TOKEN}"
           ./scripts/setup_vnc.sh "$VNC_PASSWORD" "$FINAL_TOKEN" "$NGROK_REGION"
+
+      - name: Health Check
+        run: |
+          echo "--- listener ---"
+          lsof -nP -iTCP:5900 -sTCP:LISTEN || echo "NOT LISTENING"
+          echo "--- console session owner ---"
+          stat -f '%Su' /dev/console
+          echo "--- Screen Sharing TCC grant ---"
+          sudo sqlite3 "/Library/Application Support/com.apple.TCC/TCC.db" \
+            "SELECT service||' -> '||client||' auth='||auth_value FROM access WHERE client='com.apple.screensharing.agent';"
+          echo "--- SIP (must NOT be enabled for the TCC write to work) ---"
+          sudo csrutil status || true
 
       - name: Keep-Alive Loop (Up to 6 Hours)
         run: |

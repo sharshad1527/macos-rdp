@@ -32,26 +32,49 @@ if ! dscl . -read /Users/vncuser &>/dev/null; then
 fi
 sudo dscl . -passwd /Users/runner "$VNC_PASSWORD" 2>/dev/null || true
 
-# 4. Enable Apple Remote Management & legacy VNC client support
+# 4. Pre-approve Screen Sharing's TCC privileges BEFORE starting the agent.
+#    `kickstart` cannot do this on macOS 12.1+ (Apple requires System Settings
+#    or MDM), and there is no human at the desktop on a CI runner. Without it
+#    the RFB daemon starts and authenticates but every framebuffer grab is
+#    refused by TCC -> black screen + "Screen recording might be disabled".
+echo "==> Granting Screen Recording / Accessibility to Screen Sharing..."
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+chmod +x "$SCRIPT_DIR/grant_tcc.sh"
+# Non-fatal on purpose: if the grant fails we still want the tunnels to come up
+# and the Health Check step to run, so the failure is diagnosable instead of
+# just aborting the job with no output.
+"$SCRIPT_DIR/grant_tcc.sh" || \
+  echo "!! TCC grant failed - VNC will authenticate but show a BLACK SCREEN." >&2
+
+# 5. Enable Apple Remote Management & legacy VNC client support
 echo "==> Configuring Apple Remote Management..."
 sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
   -activate -configure -allowAccessFor -allUsers -privs -all \
-  -clientopts -setvnclegacy -vnclegacy yes
+  -clientopts -setvnclegacy -vnclegacy "${LEGACY_VNC:-yes}"
 
-# 5. Set legacy VNC password hash in system preferences
+# 6. Set legacy VNC password hash in system preferences
 echo "==> Setting VNC authentication hash..."
 echo "$VNC_PASSWORD" | perl -we 'BEGIN { @k = unpack "C*", pack "H*", "1734516E8BA8C5E2"}; $_ = <>; chomp; s/^(.{8}).*/$1/; @p = unpack "C*", $_; foreach (@k) { printf "%02X", $_ ^ (shift @p || 0) }; print "\n"' | sudo tee /Library/Preferences/com.apple.VNCSettings.txt
 
-# 6. Restart ARD Agent
+# 7. Restart ARD Agent (must happen AFTER grant_tcc.sh so the agent starts
+#    with the grant already in place)
 echo "==> Restarting ARD service..."
 sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
   -restart -agent -console
 sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
   -activate
 
-echo "✅ macOS Screen Sharing & VNC is active on port 5900!"
+# 8. Prove the listener is actually up before we advertise a tunnel URL.
+sleep 2
+if lsof -nP -iTCP:5900 -sTCP:LISTEN >/dev/null 2>&1; then
+  echo "✅ macOS Screen Sharing & VNC is listening on port 5900!"
+else
+  echo "❌ Nothing is listening on 5900 - VNC will not connect. Check the ARD logs above." >&2
+  sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
+    -restart -agent -console -verbose 2>&1 | tail -30 >&2 || true
+fi
 
-# 7. Start tunnels
+# 9. Start tunnels
 echo ""
 echo "=========================================================="
 echo "🌐 Starting Remote Tunnels..."
